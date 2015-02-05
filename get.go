@@ -15,41 +15,36 @@ import (
 	"time"
 )
 
-type SharedBeanstalkd struct {
-	Beanstalkd *lentil.Beanstalkd
-	Sem        chan bool
-}
-
 type BeanstalkSettings struct {
-	Addr         string
-	WatchChannel string
-	UseChannel   string
+	addr         string
+	watchChannel string
+	useChannel   string
 }
 
 type Worker struct {
-	WorkerId     int
-	Beanstalkd   *lentil.Beanstalkd
-	Stats        *GetStats
-	ConnSettings BeanstalkSettings
+	workerId     int
+	beanstalkd   *lentil.Beanstalkd
+	stats        *GetStats
+	connSettings BeanstalkSettings
 }
 
 func (this *Worker) Connect() error {
 
 	var e error
-	this.Beanstalkd, e = lentil.Dial(this.ConnSettings.Addr)
+	this.beanstalkd, e = lentil.Dial(this.connSettings.addr)
 	if e != nil {
 		return e
 	}
 
-	if this.ConnSettings.WatchChannel != "" {
-		_, e = this.Beanstalkd.Watch(this.ConnSettings.WatchChannel)
+	if this.connSettings.watchChannel != "" {
+		_, e = this.beanstalkd.Watch(this.connSettings.watchChannel)
 		if e != nil {
 			return e
 		}
 	}
 
-	if this.ConnSettings.UseChannel != "" {
-		e = this.Beanstalkd.Use(this.ConnSettings.UseChannel)
+	if this.connSettings.useChannel != "" {
+		e = this.beanstalkd.Use(this.connSettings.useChannel)
 		if e != nil {
 			return e
 		}
@@ -59,51 +54,66 @@ func (this *Worker) Connect() error {
 }
 
 func (this *Worker) processMessage() error {
-	job, e := this.Beanstalkd.Reserve()
+	job, e := this.beanstalkd.Reserve()
 	if e != nil {
 		log.Printf(e.Error())
 		return e
 	}
-	log.Printf("Worker[%d]: Got new Job: %s", this.WorkerId, job.Body)
+	log.Printf("Worker[%d]: Got new Job: %s", this.workerId, job.Body)
 	// Check for valid url
 	uri := string(job.Body[:])
 	u, err := url.Parse(uri)
 	if err != nil {
 		log.Printf(err.Error())
-		this.Beanstalkd.Delete(job.Id)
+		this.beanstalkd.Delete(job.Id)
 		return err
 	}
 
 	if !u.IsAbs() {
-		log.Printf("Worker[%d]: Invalid URL: \"%s\". Ignoring message.", this.WorkerId, u)
-		this.Beanstalkd.Delete(job.Id)
+		log.Printf("Worker[%d]: Invalid URL: \"%s\". Ignoring message.", this.workerId, u)
+		this.beanstalkd.Delete(job.Id)
 		return nil
 	}
 
 	product, err := scraping.GetProductData(uri)
 
 	if err != nil {
-		this.Beanstalkd.Delete(job.Id)
+		if ae, ok := err.(*scraping.ScrapeError); ok {
+			if ae.Arg == scraping.SITE_ERROR {
+				log.Printf("Worker[%d]: Site error por url: %s", this.workerId, u)
+				this.beanstalkd.Delete(job.Id)
+				return err
+			} else {
+				// If INVALID URL or CLIENT ERROR
+				log.Printf("Worker[%d]: Invalid Url (%s) or Client error: %s", this.workerId, u, err.Error())
+				this.beanstalkd.Delete(job.Id)
+				return nil
+			}
+		}
+		this.beanstalkd.Delete(job.Id)
 		return err
 	}
 
 	productJson, err := json.Marshal(product)
 
 	if err != nil {
-		log.Printf("Worker[%d]: Error marshaling product %s: %s", this.WorkerId, product, err.Error())
+		log.Printf("Worker[%d]: Error marshaling product %s: %s", this.workerId, product, err.Error())
+		this.beanstalkd.Delete(job.Id)
+		return err
 	}
 
 	var jsonStr = []byte(productJson)
 
-	msgId, e := this.Beanstalkd.Put(0, 0, 0, jsonStr)
+	msgId, e := this.beanstalkd.Put(0, 0, 0, jsonStr)
 	if err != nil {
-		log.Printf("Worker[%d]: Error sending product json: %s", this.WorkerId, err.Error())
+		log.Printf("Worker[%d]: Error sending product json: %s", this.workerId, err.Error())
+		// Do not delete job, trying again.
 		return err
 	}
 
-	this.Beanstalkd.Delete(job.Id)
-	log.Printf("Worker[%d]: Job %d, %s, new product message (%d)", this.WorkerId, job.Id, product.Name, msgId)
-	this.Stats.totalFetched++
+	this.beanstalkd.Delete(job.Id)
+	log.Printf("Worker[%d]: Job %d, %s, new product message (%d)", this.workerId, job.Id, product.Name, msgId)
+	this.stats.totalFetched++
 
 	return nil
 }
@@ -115,11 +125,11 @@ func (this *Worker) run() {
 		// Error management
 		if err != nil {
 			if oe, ok := err.(*net.OpError); ok && (oe.Err == syscall.EPIPE || oe.Err == syscall.ECONNRESET) {
-				log.Printf("Worker[%d]: Error with pipe. Trying to reconnect.", this.WorkerId)
+				log.Printf("Worker[%d]: Error with pipe. Trying to reconnect.", this.workerId)
 				for {
 					err = this.Connect()
 					if err == nil {
-						log.Printf("Worker[%d]: Reconnected succesfully!", this.WorkerId)
+						log.Printf("Worker[%d]: Reconnected succesfully!", this.workerId)
 						break
 					} else {
 						time.Sleep(time.Second)
@@ -127,12 +137,12 @@ func (this *Worker) run() {
 				}
 			} else {
 				errors++
-				if errors > 20 {
-					log.Printf("Worker[%d]: Too many errors. Aborting worker.", this.WorkerId)
+				if errors > 100 {
+					log.Printf("Worker[%d]: Too many errors. Aborting worker.", this.workerId)
 					return
 				} else if errors > 2 {
-					log.Printf("Worker[%d]: %d secuential errors. Sleeping temporarly", this.WorkerId, errors)
-					time.Sleep(time.Second * 5)
+					log.Printf("Worker[%d]: %d secuential errors. Sleeping temporarly. Error: %s", this.workerId, errors, err.Error())
+					time.Sleep(time.Second * 2)
 				}
 			}
 		} else {
@@ -151,15 +161,15 @@ func main() {
 	var numWorkers int
 	flag.IntVar(&numWorkers, "workers", 10, "number of (goroutines) workers")
 	var watchChannel string
-	flag.StringVar(&watchChannel, "watchChannel", "fetch", "api endpoint to post results (host:port)")
+	flag.StringVar(&watchChannel, "watchChannel", "fetch", "beanstalk watch channel to receive urls.")
 	var useChannel string
-	flag.StringVar(&useChannel, "putChannel", "products", "api endpoint to post results (host:port)")
+	flag.StringVar(&useChannel, "putChannel", "products", "beanstalk use channel to send product jsons.")
 	flag.Parse()
 
 	settings := BeanstalkSettings{
-		Addr:         beanstalkdAddr,
-		WatchChannel: watchChannel,
-		UseChannel:   useChannel,
+		addr:         beanstalkdAddr,
+		watchChannel: watchChannel,
+		useChannel:   useChannel,
 	}
 
 	stats := new(GetStats)
@@ -169,9 +179,9 @@ func main() {
 
 	for w := 1; w <= numWorkers; w++ {
 		worker := new(Worker)
-		worker.ConnSettings = settings
-		worker.WorkerId = w
-		worker.Stats = stats
+		worker.connSettings = settings
+		worker.workerId = w
+		worker.stats = stats
 		err := worker.Connect()
 		if err != nil {
 			log.Printf("Error connecting worker to beanstalkd %s. Exiting.", beanstalkdAddr)
