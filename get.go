@@ -137,12 +137,9 @@ func (this *Worker) run() {
 				}
 			} else {
 				errors++
-				if errors > 100 {
-					log.Printf("Worker[%d]: Too many errors. Aborting worker.", this.workerId)
-					return
-				} else if errors > 2 {
+				if errors > 2 {
 					log.Printf("Worker[%d]: %d secuential errors. Sleeping temporarly. Error: %s", this.workerId, errors, err.Error())
-					time.Sleep(time.Second * 2)
+					time.Sleep(time.Second * time.Duration(errors))
 				}
 			}
 		} else {
