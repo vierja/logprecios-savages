@@ -83,6 +83,10 @@ func (this *Worker) processMessage() error {
 				log.Printf("Worker[%d]: Site error por url: %s", this.workerId, u)
 				this.beanstalkd.Delete(job.Id)
 				return err
+			} else if ae.Arg == scraping.PARSING_ERROR {
+				log.Printf("Worker[%d]: Parsing error for url: %s. Ignoring error.", this.workerId, u)
+				this.beanstalkd.Delete(job.Id)
+				return nil
 			} else {
 				// If INVALID URL or CLIENT ERROR
 				log.Printf("Worker[%d]: Invalid Url (%s) or Client error: %s", this.workerId, u, err.Error())
